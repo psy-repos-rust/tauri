@@ -4,11 +4,14 @@
 // SPDX-License-Identifier: MIT
 
 use super::category::AppCategory;
-use crate::bundle::{common, platform::target_triple};
+use crate::{bundle::platform::target_triple, utils::fs_utils};
 use anyhow::Context;
 pub use tauri_utils::config::WebviewInstallMode;
 use tauri_utils::{
-  config::{BundleType, DeepLinkProtocol, FileAssociation, NSISInstallerMode, NsisCompression},
+  config::{
+    BundleType, DeepLinkProtocol, FileAssociation, NSISInstallerMode, NsisCompression,
+    RpmCompression,
+  },
   resources::{external_binaries, ResourcePaths},
 };
 
@@ -170,6 +173,8 @@ pub struct DebianSettings {
   // OS-specific settings:
   /// the list of debian dependencies.
   pub depends: Option<Vec<String>>,
+  /// the list of debian dependencies recommendations.
+  pub recommends: Option<Vec<String>>,
   /// the list of dependencies the package provides.
   pub provides: Option<Vec<String>>,
   /// the list of package conflicts.
@@ -215,6 +220,10 @@ pub struct DebianSettings {
 pub struct AppImageSettings {
   /// The files to include in the Appimage Binary.
   pub files: HashMap<PathBuf, PathBuf>,
+  /// Whether to include gstreamer plugins for audio/media support.
+  pub bundle_media_framework: bool,
+  /// Whether to include the `xdg-open` binary.
+  pub bundle_xdg_open: bool,
 }
 
 /// The RPM bundle settings.
@@ -222,13 +231,15 @@ pub struct AppImageSettings {
 pub struct RpmSettings {
   /// The list of RPM dependencies your application relies on.
   pub depends: Option<Vec<String>>,
+  /// the list of of RPM dependencies your application recommends.
+  pub recommends: Option<Vec<String>>,
   /// The list of RPM dependencies your application provides.
   pub provides: Option<Vec<String>>,
   /// The list of RPM dependencies your application conflicts with. They must not be present
   /// in order for the package to be installed.
   pub conflicts: Option<Vec<String>>,
   /// The list of RPM dependencies your application supersedes - if this package is installed,
-  /// packages listed as “obsoletes” will be automatically removed (if they are present).
+  /// packages listed as "obsoletes" will be automatically removed (if they are present).
   pub obsoletes: Option<Vec<String>>,
   /// The RPM release tag.
   pub release: String,
@@ -258,6 +269,8 @@ pub struct RpmSettings {
   /// Path to script that will be executed after the package is removed. See
   /// <http://ftp.rpm.org/max-rpm/s1-rpm-inside-scripts.html>
   pub post_remove_script: Option<PathBuf>,
+  /// Compression algorithm and level. Defaults to `Gzip` with level 6.
+  pub compression: Option<RpmCompression>,
 }
 
 /// Position coordinates struct.
@@ -351,6 +364,15 @@ impl Default for WixLanguage {
 /// Settings specific to the WiX implementation.
 #[derive(Clone, Debug, Default)]
 pub struct WixSettings {
+  /// MSI installer version in the format `major.minor.patch.build` (build is optional).
+  ///
+  /// Because a valid version is required for MSI installer, it will be derived from [`PackageSettings::version`] if this field is not set.
+  ///
+  /// The first field is the major version and has a maximum value of 255. The second field is the minor version and has a maximum value of 255.
+  /// The third and fourth fields have a maximum value of 65,535.
+  ///
+  /// See <https://learn.microsoft.com/en-us/windows/win32/msi/productversion> for more info.
+  pub version: Option<String>,
   /// A GUID upgrade code for MSI installer. This code **_must stay the same across all of your updates_**,
   /// otherwise, Windows will treat your update as a different app and your users will have duplicate versions of your app.
   ///
@@ -386,7 +408,7 @@ pub struct WixSettings {
   pub banner_path: Option<PathBuf>,
   /// Path to a bitmap file to use on the installation user interface dialogs.
   /// It is used on the welcome and completion dialogs.
-
+  ///
   /// The required dimensions are 493px × 312px.
   pub dialog_image_path: Option<PathBuf>,
   /// Enables FIPS compliant algorithms.
@@ -501,6 +523,7 @@ pub struct WindowsSettings {
   /// Nsis configuration.
   pub nsis: Option<NsisSettings>,
   /// The path to the application icon. Defaults to `./icons/icon.ico`.
+  #[deprecated = "This is used for the MSI installer and will be removed in 3.0.0, use `BundleSettings::icon` field and make sure a `.ico` icon exists instead."]
   pub icon_path: PathBuf,
   /// The installation mode for the Webview2 runtime.
   pub webview_install_mode: WebviewInstallMode,
@@ -526,19 +549,24 @@ pub struct WindowsSettings {
   pub sign_command: Option<CustomSignCommandSettings>,
 }
 
-impl Default for WindowsSettings {
-  fn default() -> Self {
-    Self {
-      digest_algorithm: None,
-      certificate_thumbprint: None,
-      timestamp_url: None,
-      tsp: false,
-      wix: None,
-      nsis: None,
-      icon_path: PathBuf::from("icons/icon.ico"),
-      webview_install_mode: Default::default(),
-      allow_downgrades: true,
-      sign_command: None,
+#[allow(deprecated)]
+mod _default {
+  use super::*;
+
+  impl Default for WindowsSettings {
+    fn default() -> Self {
+      Self {
+        digest_algorithm: None,
+        certificate_thumbprint: None,
+        timestamp_url: None,
+        tsp: false,
+        wix: None,
+        nsis: None,
+        icon_path: PathBuf::from("icons/icon.ico"),
+        webview_install_mode: Default::default(),
+        allow_downgrades: true,
+        sign_command: None,
+      }
     }
   }
 }
@@ -681,6 +709,22 @@ impl BundleBinary {
   pub fn src_path(&self) -> Option<&String> {
     self.src_path.as_ref()
   }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Arch {
+  /// For the x86_64 / x64 / AMD64 instruction sets (64 bits).
+  X86_64,
+  /// For the x86 / i686 / i686 / 8086 instruction sets (32 bits).
+  X86,
+  /// For the AArch64 / ARM64 instruction sets (64 bits).
+  AArch64,
+  /// For the AArch32 / ARM32 instruction sets with hard-float (32 bits).
+  Armhf,
+  /// For the AArch32 / ARM32 instruction sets with soft-float (32 bits).
+  Armel,
+  /// For universal macOS applications.
+  Universal,
 }
 
 /// The Settings exposed by the module.
@@ -845,17 +889,19 @@ impl Settings {
   }
 
   /// Returns the architecture for the binary being bundled (e.g. "arm", "x86" or "x86_64").
-  pub fn binary_arch(&self) -> &str {
+  pub fn binary_arch(&self) -> Arch {
     if self.target.starts_with("x86_64") {
-      "x86_64"
+      Arch::X86_64
     } else if self.target.starts_with('i') {
-      "x86"
+      Arch::X86
+    } else if self.target.starts_with("arm") && self.target.ends_with("hf") {
+      Arch::Armhf
     } else if self.target.starts_with("arm") {
-      "arm"
+      Arch::Armel
     } else if self.target.starts_with("aarch64") {
-      "aarch64"
+      Arch::AArch64
     } else if self.target.starts_with("universal") {
-      "universal"
+      Arch::Universal
     } else {
       panic!("Unexpected target triple {}", self.target)
     }
@@ -866,6 +912,16 @@ impl Settings {
     self
       .binaries
       .iter()
+      .find(|bin| bin.main)
+      .context("failed to find main binary, make sure you have a `package > default-run` in the Cargo.toml file")
+      .map_err(Into::into)
+  }
+
+  /// Returns the file name of the binary being bundled.
+  pub fn main_binary_mut(&mut self) -> crate::Result<&mut BundleBinary> {
+    self
+      .binaries
+      .iter_mut()
       .find(|bin| bin.main)
       .context("failed to find main binary, make sure you have a `package > default-run` in the Cargo.toml file")
       .map_err(Into::into)
@@ -1012,7 +1068,7 @@ impl Settings {
           .to_string_lossy()
           .replace(&format!("-{}", self.target), ""),
       );
-      common::copy_file(&src, &dest)?;
+      fs_utils::copy_file(&src, &dest)?;
       paths.push(dest);
     }
     Ok(paths)
@@ -1023,7 +1079,7 @@ impl Settings {
     for resource in self.resource_files().iter() {
       let resource = resource?;
       let dest = path.join(resource.target());
-      common::copy_file(resource.path(), dest)?;
+      fs_utils::copy_file(resource.path(), &dest)?;
     }
     Ok(())
   }

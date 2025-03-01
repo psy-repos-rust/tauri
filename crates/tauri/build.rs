@@ -57,6 +57,7 @@ const PLUGINS: &[(&str, &[(&str, bool)])] = &[
       ("is_minimizable", true),
       ("is_closable", true),
       ("is_visible", true),
+      ("is_enabled", true),
       ("title", true),
       ("current_monitor", true),
       ("primary_monitor", true),
@@ -67,6 +68,7 @@ const PLUGINS: &[(&str, &[(&str, bool)])] = &[
       // setters
       ("center", false),
       ("request_user_attention", false),
+      ("set_enabled", false),
       ("set_resizable", false),
       ("set_maximizable", false),
       ("set_minimizable", false),
@@ -103,9 +105,14 @@ const PLUGINS: &[(&str, &[(&str, bool)])] = &[
       ("start_dragging", false),
       ("start_resize_dragging", false),
       ("set_progress_bar", false),
+      ("set_badge_count", false),
+      ("set_overlay_icon", false),
+      ("set_badge_label", false),
       ("set_icon", false),
       ("set_title_bar_style", false),
+      ("set_theme", false),
       ("toggle_maximize", false),
+      ("set_background_color", false),
       // internal
       ("internal_toggle_maximize", true),
     ],
@@ -125,9 +132,12 @@ const PLUGINS: &[(&str, &[(&str, bool)])] = &[
       ("set_webview_position", false),
       ("set_webview_focus", false),
       ("set_webview_zoom", false),
+      ("webview_hide", false),
+      ("webview_show", false),
       ("print", false),
       ("reparent", false),
       ("clear_all_browsing_data", false),
+      ("set_webview_background_color", false),
       // internal
       ("internal_toggle_devtools", true),
     ],
@@ -141,6 +151,7 @@ const PLUGINS: &[(&str, &[(&str, bool)])] = &[
       ("app_show", false),
       ("app_hide", false),
       ("default_window_icon", false),
+      ("set_app_theme", false),
     ],
   ),
   (
@@ -248,19 +259,19 @@ fn main() {
   // workaround needed to prevent `STATUS_ENTRYPOINT_NOT_FOUND` error in tests
   // see https://github.com/tauri-apps/tauri/pull/4383#issuecomment-1212221864
   let target_env = std::env::var("CARGO_CFG_TARGET_ENV");
-  let is_tauri_workspace = std::env::var("__TAURI_WORKSPACE__").map_or(false, |v| v == "true");
+  let is_tauri_workspace = std::env::var("__TAURI_WORKSPACE__").is_ok_and(|v| v == "true");
   if is_tauri_workspace && target_os == "windows" && Ok("msvc") == target_env.as_deref() {
     embed_manifest_for_tests();
   }
 
   if target_os == "android" {
-    if let Ok(kotlin_out_dir) = std::env::var("WRY_ANDROID_KOTLIN_FILES_OUT_DIR") {
-      fn env_var(var: &str) -> String {
-        std::env::var(var).unwrap_or_else(|_| {
-          panic!("`{var}` is not set, which is needed to generate the kotlin files for android.")
-        })
-      }
+    fn env_var(var: &str) -> String {
+      std::env::var(var).unwrap_or_else(|_| {
+        panic!("`{var}` is not set, which is needed to generate the kotlin files for android.")
+      })
+    }
 
+    if let Ok(kotlin_out_dir) = std::env::var("WRY_ANDROID_KOTLIN_FILES_OUT_DIR") {
       let package = env_var("WRY_ANDROID_PACKAGE");
       let library = env_var("WRY_ANDROID_LIBRARY");
 
@@ -293,11 +304,10 @@ fn main() {
     }
 
     if let Some(project_dir) = env::var_os("TAURI_ANDROID_PROJECT_PATH").map(PathBuf::from) {
-      let tauri_proguard = include_str!("./mobile/proguard-tauri.pro").replace(
-        "$PACKAGE",
-        &env::var("WRY_ANDROID_PACKAGE")
-          .expect("missing `WRY_ANDROID_PACKAGE` environment variable"),
-      );
+      let package_unescaped = env::var("TAURI_ANDROID_PACKAGE_UNESCAPED")
+        .unwrap_or_else(|_| env_var("WRY_ANDROID_PACKAGE").replace('`', ""));
+      let tauri_proguard =
+        include_str!("./mobile/proguard-tauri.pro").replace("$PACKAGE", &package_unescaped);
       std::fs::write(
         project_dir.join("app").join("proguard-tauri.pro"),
         tauri_proguard,
@@ -366,10 +376,12 @@ permissions = [{default_permissions}]
       .unwrap_or_else(|_| panic!("unable to autogenerate default permissions"));
 
     let permissions = tauri_utils::acl::build::define_permissions(
-      &permissions_out_dir
-        .join("**")
-        .join("*.toml")
-        .to_string_lossy(),
+      &PathBuf::from(glob::Pattern::escape(
+        &permissions_out_dir.to_string_lossy(),
+      ))
+      .join("**")
+      .join("*.toml")
+      .to_string_lossy(),
       &format!("tauri:{plugin}"),
       out_dir,
       |_| true,
@@ -418,11 +430,15 @@ permissions = [{}]
       .join(",")
   );
 
-  write_if_changed(&default_toml, toml_content)
+  write_if_changed(default_toml, toml_content)
     .unwrap_or_else(|_| panic!("unable to autogenerate core:default set"));
 
   let _ = tauri_utils::acl::build::define_permissions(
-    &permissions_out_dir.join("*.toml").to_string_lossy(),
+    &PathBuf::from(glob::Pattern::escape(
+      &permissions_out_dir.to_string_lossy(),
+    ))
+    .join("*.toml")
+    .to_string_lossy(),
     "tauri:core",
     out_dir,
     |_| true,

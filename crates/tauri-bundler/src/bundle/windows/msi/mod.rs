@@ -3,16 +3,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use crate::bundle::{
-  common::CommandExt,
-  path_utils::{copy_file, FileOpts},
-  settings::Settings,
-  windows::{
-    sign::try_sign,
-    util::{
-      download_and_verify, download_webview2_bootstrapper, download_webview2_offline_installer,
-      extract_zip, HashAlgorithm, WIX_OUTPUT_FOLDER_NAME, WIX_UPDATER_OUTPUT_FOLDER_NAME,
+use crate::{
+  bundle::{
+    settings::{Arch, Settings},
+    windows::{
+      sign::try_sign,
+      util::{
+        download_webview2_bootstrapper, download_webview2_offline_installer,
+        WIX_OUTPUT_FOLDER_NAME, WIX_UPDATER_OUTPUT_FOLDER_NAME,
+      },
     },
+  },
+  utils::{
+    fs_utils::copy_file,
+    http_utils::{download_and_verify, extract_zip, HashAlgorithm},
+    CommandExt,
   },
 };
 use anyhow::{bail, Context};
@@ -21,6 +26,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
   collections::{BTreeMap, HashMap, HashSet},
+  ffi::OsStr,
   fs::{self, File},
   io::Write,
   path::{Path, PathBuf},
@@ -197,14 +203,7 @@ fn copy_icon(settings: &Settings, filename: &str, path: &Path) -> crate::Result<
 
   let icon_path = std::env::current_dir()?.join(path);
 
-  copy_file(
-    icon_path,
-    &icon_target_path,
-    &FileOpts {
-      overwrite: true,
-      ..Default::default()
-    },
-  )?;
+  copy_file(&icon_path, &icon_target_path)?;
 
   Ok(icon_target_path)
 }
@@ -217,12 +216,12 @@ fn app_installer_output_path(
   updater: bool,
 ) -> crate::Result<PathBuf> {
   let arch = match settings.binary_arch() {
-    "x86" => "x86",
-    "x86_64" => "x64",
-    "aarch64" => "arm64",
+    Arch::X86_64 => "x64",
+    Arch::X86 => "x86",
+    Arch::AArch64 => "arm64",
     target => {
       return Err(crate::Error::ArchError(format!(
-        "Unsupported architecture: {}",
+        "Unsupported architecture: {:?}",
         target
       )))
     }
@@ -281,19 +280,37 @@ fn clear_env_for_wix(cmd: &mut Command) {
   }
 }
 
-// WiX requires versions to be numeric only in a `major.minor.patch.build` format
-pub fn convert_version(version_str: &str) -> anyhow::Result<String> {
-  let version = semver::Version::parse(version_str).context("invalid app version")?;
-  if version.major > 255 {
+fn validate_wix_version(version_str: &str) -> anyhow::Result<()> {
+  let components = version_str
+    .split('.')
+    .flat_map(|c| c.parse::<u64>().ok())
+    .collect::<Vec<_>>();
+
+  anyhow::ensure!(
+    components.len() >= 3,
+    "app wix version should be in the format major.minor.patch.build (build is optional)"
+  );
+
+  if components[0] > 255 {
     bail!("app version major number cannot be greater than 255");
   }
-  if version.minor > 255 {
+  if components[1] > 255 {
     bail!("app version minor number cannot be greater than 255");
   }
-  if version.patch > 65535 {
+  if components[2] > 65535 {
     bail!("app version patch number cannot be greater than 65535");
   }
 
+  if components.len() == 4 && components[3] > 65535 {
+    bail!("app version build number cannot be greater than 65535");
+  }
+
+  Ok(())
+}
+
+// WiX requires versions to be numeric only in a `major.minor.patch.build` format
+fn convert_version(version_str: &str) -> anyhow::Result<String> {
+  let version = semver::Version::parse(version_str).context("invalid app version")?;
   if !version.build.is_empty() {
     let build = version.build.parse::<u64>();
     if build.map(|b| b <= 65535).unwrap_or_default() {
@@ -330,12 +347,12 @@ fn run_candle(
   extensions: Vec<PathBuf>,
 ) -> crate::Result<()> {
   let arch = match settings.binary_arch() {
-    "x86_64" => "x64",
-    "x86" => "x86",
-    "aarch64" => "arm64",
+    Arch::X86_64 => "x64",
+    Arch::X86 => "x86",
+    Arch::AArch64 => "arm64",
     target => {
       return Err(crate::Error::ArchError(format!(
-        "unsupported target: {}",
+        "unsupported architecture: {:?}",
         target
       )))
     }
@@ -421,18 +438,29 @@ pub fn build_wix_app_installer(
   updater: bool,
 ) -> crate::Result<Vec<PathBuf>> {
   let arch = match settings.binary_arch() {
-    "x86_64" => "x64",
-    "x86" => "x86",
-    "aarch64" => "arm64",
+    Arch::X86_64 => "x64",
+    Arch::X86 => "x86",
+    Arch::AArch64 => "arm64",
     target => {
       return Err(crate::Error::ArchError(format!(
-        "unsupported target: {}",
+        "unsupported architecture: {:?}",
         target
       )))
     }
   };
 
-  let app_version = convert_version(settings.version_string())?;
+  let app_version = if let Some(version) = settings
+    .windows()
+    .wix
+    .as_ref()
+    .and_then(|wix| wix.version.clone())
+  {
+    version
+  } else {
+    convert_version(settings.version_string())?
+  };
+
+  validate_wix_version(&app_version)?;
 
   // target only supports x64.
   log::info!("Target: {}", arch);
@@ -562,13 +590,6 @@ pub fn build_wix_app_installer(
       )
     });
   data.insert("upgrade_code", to_json(upgrade_code.to_string()));
-
-  let product_code = Uuid::new_v5(
-    &Uuid::NAMESPACE_DNS,
-    settings.bundle_identifier().as_bytes(),
-  )
-  .to_string();
-  data.insert("product_code", to_json(product_code.as_str()));
   data.insert(
     "allow_downgrades",
     to_json(settings.windows().allow_downgrades),
@@ -611,7 +632,17 @@ pub fn build_wix_app_installer(
   data.insert("main_binary_path", to_json(main_binary_path));
 
   // copy icon from `settings.windows().icon_path` folder to resource folder near msi
-  let icon_path = copy_icon(settings, "icon.ico", &settings.windows().icon_path)?;
+  #[allow(deprecated)]
+  let icon_path = if !settings.windows().icon_path.as_os_str().is_empty() {
+    settings.windows().icon_path.clone()
+  } else {
+    settings
+      .icon_files()
+      .flatten()
+      .find(|i| i.extension() == Some(OsStr::new("ico")))
+      .context("Couldn't find a .ico icon")?
+  };
+  let icon_path = copy_icon(settings, "icon.ico", &icon_path)?;
 
   data.insert("icon_path", to_json(icon_path));
 
@@ -693,38 +724,26 @@ pub fn build_wix_app_installer(
     );
 
     // Create the update task XML
-    let mut skip_uac_task = Handlebars::new();
+    let skip_uac_task = Handlebars::new();
     let xml = include_str!("./update-task.xml");
-    skip_uac_task
-      .register_template_string("update.xml", xml)
-      .map_err(|e| e.to_string())
-      .expect("Failed to setup Update Task handlebars");
+    let update_content = skip_uac_task.render_template(xml, &data)?;
     let temp_xml_path = output_path.join("update.xml");
-    let update_content = skip_uac_task.render("update.xml", &data)?;
     fs::write(temp_xml_path, update_content)?;
 
     // Create the Powershell script to install the task
     let mut skip_uac_task_installer = Handlebars::new();
     skip_uac_task_installer.register_escape_fn(handlebars::no_escape);
     let xml = include_str!("./install-task.ps1");
-    skip_uac_task_installer
-      .register_template_string("install-task.ps1", xml)
-      .map_err(|e| e.to_string())
-      .expect("Failed to setup Update Task Installer handlebars");
+    let install_script_content = skip_uac_task_installer.render_template(xml, &data)?;
     let temp_ps1_path = output_path.join("install-task.ps1");
-    let install_script_content = skip_uac_task_installer.render("install-task.ps1", &data)?;
     fs::write(temp_ps1_path, install_script_content)?;
 
     // Create the Powershell script to uninstall the task
     let mut skip_uac_task_uninstaller = Handlebars::new();
     skip_uac_task_uninstaller.register_escape_fn(handlebars::no_escape);
     let xml = include_str!("./uninstall-task.ps1");
-    skip_uac_task_uninstaller
-      .register_template_string("uninstall-task.ps1", xml)
-      .map_err(|e| e.to_string())
-      .expect("Failed to setup Update Task Uninstaller handlebars");
+    let install_script_content = skip_uac_task_uninstaller.render_template(xml, &data)?;
     let temp_ps1_path = output_path.join("uninstall-task.ps1");
-    let install_script_content = skip_uac_task_uninstaller.render("uninstall-task.ps1", &data)?;
     fs::write(temp_ps1_path, install_script_content)?;
 
     data.insert("enable_elevated_update_task", to_json(true));
@@ -739,7 +758,9 @@ pub fn build_wix_app_installer(
   let extension_regex = Regex::new("\"http://schemas.microsoft.com/wix/(\\w+)\"")?;
   for fragment_path in fragment_paths {
     let fragment_path = current_dir.join(fragment_path);
-    let fragment = fs::read_to_string(&fragment_path)?;
+    let fragment_content = fs::read_to_string(&fragment_path)?;
+    let fragment_handlebars = Handlebars::new();
+    let fragment = fragment_handlebars.render_template(&fragment_content, &data)?;
     let mut extensions = Vec::new();
     for cap in extension_regex.captures_iter(&fragment) {
       extensions.push(wix_toolset_path.join(format!("Wix{}.dll", &cap[1])));
@@ -908,12 +929,11 @@ fn get_merge_modules(settings: &Settings) -> crate::Result<Vec<MergeModule>> {
   let mut merge_modules = Vec::new();
   let regex = Regex::new(r"[^\w\d\.]")?;
   for msm in glob::glob(
-    settings
-      .project_out_directory()
-      .join("*.msm")
-      .to_string_lossy()
-      .to_string()
-      .as_str(),
+    &PathBuf::from(glob::Pattern::escape(
+      &settings.project_out_directory().to_string_lossy(),
+    ))
+    .join("*.msm")
+    .to_string_lossy(),
   )? {
     let path = msm?;
     let filename = path
@@ -1020,8 +1040,13 @@ fn generate_resource_data(settings: &Settings) -> crate::Result<ResourceMap> {
 
   let mut dlls = Vec::new();
 
+  // TODO: The bundler should not include all DLLs it finds. Instead it should only include WebView2Loader.dll if present and leave the rest to the resources config.
   let out_dir = settings.project_out_directory();
-  for dll in glob::glob(out_dir.join("*.dll").to_string_lossy().to_string().as_str())? {
+  for dll in glob::glob(
+    &PathBuf::from(glob::Pattern::escape(&out_dir.to_string_lossy()))
+      .join("*.dll")
+      .to_string_lossy(),
+  )? {
     let path = dll?;
     let resource_path = dunce::simplified(&path);
     let relative_path = path
@@ -1039,16 +1064,48 @@ fn generate_resource_data(settings: &Settings) -> crate::Result<ResourceMap> {
   }
 
   if !dlls.is_empty() {
-    resources.insert(
-      "".to_string(),
-      ResourceDirectory {
+    resources
+      .entry("".to_string())
+      .and_modify(|r| r.files.append(&mut dlls))
+      .or_insert(ResourceDirectory {
         path: "".to_string(),
         name: "".to_string(),
         directories: vec![],
         files: dlls,
-      },
-    );
+      });
   }
 
   Ok(resources)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn validates_wix_version() {
+    assert!(validate_wix_version("1.1.1").is_ok());
+    assert!(validate_wix_version("1.1.1.1").is_ok());
+    assert!(validate_wix_version("255.1.1.1").is_ok());
+    assert!(validate_wix_version("1.255.1.1").is_ok());
+    assert!(validate_wix_version("1.1.65535.1").is_ok());
+    assert!(validate_wix_version("1.1.1.65535").is_ok());
+
+    assert!(validate_wix_version("256.1.1.1").is_err());
+    assert!(validate_wix_version("1.256.1.1").is_err());
+    assert!(validate_wix_version("1.1.65536.1").is_err());
+    assert!(validate_wix_version("1.1.1.65536").is_err());
+  }
+
+  #[test]
+  fn converts_version_to_wix() {
+    assert_eq!(convert_version("1.1.2").unwrap(), "1.1.2");
+    assert_eq!(convert_version("1.1.2-4").unwrap(), "1.1.2.4");
+    assert_eq!(convert_version("1.1.2-65535").unwrap(), "1.1.2.65535");
+    assert_eq!(convert_version("1.1.2+2").unwrap(), "1.1.2.2");
+
+    assert!(convert_version("1.1.2-alpha").is_err());
+    assert!(convert_version("1.1.2-alpha.4").is_err());
+    assert!(convert_version("1.1.2+asd.3").is_err());
+  }
 }

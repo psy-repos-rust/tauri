@@ -35,8 +35,8 @@ pub fn message_handler<R: Runtime>(
   Box::new(move |webview, request| handle_ipc_message(request, &manager, &webview.label))
 }
 
-pub fn get<R: Runtime>(manager: Arc<AppManager<R>>, label: String) -> UriSchemeProtocolHandler {
-  Box::new(move |request, responder| {
+pub fn get<R: Runtime>(manager: Arc<AppManager<R>>) -> UriSchemeProtocolHandler {
+  Box::new(move |label, request, responder| {
     #[cfg(feature = "tracing")]
     let span = tracing::trace_span!(
       "ipc::request",
@@ -44,9 +44,6 @@ pub fn get<R: Runtime>(manager: Arc<AppManager<R>>, label: String) -> UriSchemeP
       request = tracing::field::Empty
     )
     .entered();
-
-    let manager = manager.clone();
-    let label = label.clone();
 
     let respond = move |mut response: http::Response<Cow<'static, [u8]>>| {
       response
@@ -61,7 +58,7 @@ pub fn get<R: Runtime>(manager: Arc<AppManager<R>>, label: String) -> UriSchemeP
 
     match *request.method() {
       Method::POST => {
-        if let Some(webview) = manager.get_webview(&label) {
+        if let Some(webview) = manager.get_webview(label) {
           match parse_invoke_request(&manager, request) {
             Ok(request) => {
               #[cfg(feature = "tracing")]
@@ -114,7 +111,7 @@ pub fn get<R: Runtime>(manager: Arc<AppManager<R>>, label: String) -> UriSchemeP
 
                   let (mut response, mime_type) = match response {
                     InvokeResponse::Ok(InvokeResponseBody::Json(v)) => (
-                      http::Response::new(v.as_bytes().to_vec().into()),
+                      http::Response::new(v.into_bytes().into()),
                       mime::APPLICATION_JSON,
                     ),
                     InvokeResponse::Ok(InvokeResponseBody::Raw(v)) => (
@@ -148,7 +145,7 @@ pub fn get<R: Runtime>(manager: Arc<AppManager<R>>, label: String) -> UriSchemeP
                 http::Response::builder()
                   .status(StatusCode::INTERNAL_SERVER_ERROR)
                   .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
-                  .body(e.as_bytes().to_vec().into())
+                  .body(e.into_bytes().into())
                   .unwrap(),
               );
             }
@@ -158,12 +155,7 @@ pub fn get<R: Runtime>(manager: Arc<AppManager<R>>, label: String) -> UriSchemeP
             http::Response::builder()
               .status(StatusCode::INTERNAL_SERVER_ERROR)
               .header(CONTENT_TYPE, mime::TEXT_PLAIN.essence_str())
-              .body(
-                "failed to acquire webview reference"
-                  .as_bytes()
-                  .to_vec()
-                  .into(),
-              )
+              .body("failed to acquire webview reference".as_bytes().into())
               .unwrap(),
           );
         }
@@ -178,12 +170,7 @@ pub fn get<R: Runtime>(manager: Arc<AppManager<R>>, label: String) -> UriSchemeP
       }
 
       _ => {
-        let mut r = http::Response::new(
-          "only POST and OPTIONS are allowed"
-            .as_bytes()
-            .to_vec()
-            .into(),
-        );
+        let mut r = http::Response::new("only POST and OPTIONS are allowed".as_bytes().into());
         *r.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
         r.headers_mut().insert(
           CONTENT_TYPE,
@@ -415,8 +402,8 @@ fn handle_ipc_message<R: Runtime>(request: Request<String>, manager: &AppManager
                     error,
                   );
                 } else {
-                  let _ = Channel::from_callback_fn(webview, callback)
-                    .send(InvokeResponseBody::Raw(v.clone()));
+                  let _ =
+                    Channel::from_callback_fn(webview, callback).send(InvokeResponseBody::Raw(v));
                 }
               }
               InvokeResponse::Err(e) => responder_eval(
@@ -587,9 +574,13 @@ mod tests {
       Default::default(),
       StateManager::new(),
       Default::default(),
+      #[cfg(all(desktop, feature = "tray-icon"))]
+      Default::default(),
+      Default::default(),
       Default::default(),
       Default::default(),
       "".into(),
+      None,
       crate::generate_invoke_key().unwrap(),
     );
 
@@ -700,9 +691,13 @@ mod tests {
       Default::default(),
       StateManager::new(),
       Default::default(),
+      #[cfg(all(desktop, feature = "tray-icon"))]
+      Default::default(),
+      Default::default(),
       Default::default(),
       Default::default(),
       "".into(),
+      None,
       crate::generate_invoke_key().unwrap(),
     );
 

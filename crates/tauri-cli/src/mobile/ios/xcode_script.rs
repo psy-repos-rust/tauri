@@ -12,7 +12,7 @@ use crate::{
 
 use anyhow::Context;
 use cargo_mobile2::{apple::target::Target, opts::Profile};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use object::{Object, ObjectSymbol};
 
 use std::{
@@ -33,14 +33,14 @@ pub struct Options {
   #[clap(long)]
   sdk_root: PathBuf,
   /// Value of `FRAMEWORK_SEARCH_PATHS` env var
-  #[clap(long)]
-  framework_search_paths: String,
+  #[clap(long, action = ArgAction::Append, num_args(0..))]
+  framework_search_paths: Vec<String>,
   /// Value of `GCC_PREPROCESSOR_DEFINITIONS` env var
-  #[clap(long)]
-  gcc_preprocessor_definitions: String,
+  #[clap(long, action = ArgAction::Append, num_args(0..))]
+  gcc_preprocessor_definitions: Vec<String>,
   /// Value of `HEADER_SEARCH_PATHS` env var
-  #[clap(long)]
-  header_search_paths: String,
+  #[clap(long, action = ArgAction::Append, num_args(0..))]
+  header_search_paths: Vec<String>,
   /// Value of `CONFIGURATION` env var
   #[clap(long)]
   configuration: String,
@@ -68,7 +68,7 @@ pub fn command(options: Options) -> Result<()> {
   // `xcode-script` is ran from the `gen/apple` folder when not using NPM.
   // so we must change working directory to the src-tauri folder to resolve the tauri dir
   if (var_os("npm_lifecycle_event").is_none() && var_os("PNPM_PACKAGE_NAME").is_none())
-    || var("npm_config_user_agent").map_or(false, |agent| agent.starts_with("bun"))
+    || var("npm_config_user_agent").is_ok_and(|agent| agent.starts_with("bun"))
   {
     set_current_dir(current_dir()?.parent().unwrap().parent().unwrap()).unwrap();
   }
@@ -149,15 +149,17 @@ pub fn command(options: Options) -> Result<()> {
     include_dir.as_os_str(),
   );
 
-  host_env.insert(
-    "FRAMEWORK_SEARCH_PATHS",
-    options.framework_search_paths.as_ref(),
-  );
+  let framework_search_paths = options.framework_search_paths.join(" ");
+  host_env.insert("FRAMEWORK_SEARCH_PATHS", framework_search_paths.as_ref());
+
+  let gcc_preprocessor_definitions = options.gcc_preprocessor_definitions.join(" ");
   host_env.insert(
     "GCC_PREPROCESSOR_DEFINITIONS",
-    options.gcc_preprocessor_definitions.as_ref(),
+    gcc_preprocessor_definitions.as_ref(),
   );
-  host_env.insert("HEADER_SEARCH_PATHS", options.header_search_paths.as_ref());
+
+  let header_search_paths = options.header_search_paths.join(" ");
+  host_env.insert("HEADER_SEARCH_PATHS", header_search_paths.as_ref());
 
   let macos_target = Target::macos();
 

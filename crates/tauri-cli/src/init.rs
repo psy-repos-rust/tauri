@@ -131,10 +131,7 @@ impl Options {
       )
     })?;
 
-    let detected_package_manager = match PackageManager::from_project(&self.directory).first() {
-      Some(&package_manager) => package_manager,
-      None => PackageManager::Npm,
-    };
+    let detected_package_manager = PackageManager::from_project(&self.directory);
 
     self.before_dev_command = self
       .before_dev_command
@@ -171,6 +168,7 @@ fn default_dev_command(pm: PackageManager) -> &'static str {
     PackageManager::Npm => "npm run dev",
     PackageManager::Pnpm => "pnpm dev",
     PackageManager::Bun => "bun dev",
+    PackageManager::Deno => "deno task dev",
   }
 }
 
@@ -181,6 +179,7 @@ fn default_build_command(pm: PackageManager) -> &'static str {
     PackageManager::Npm => "npm run build",
     PackageManager::Pnpm => "pnpm build",
     PackageManager::Bun => "bun build",
+    PackageManager::Deno => "deno task build",
   }
 }
 

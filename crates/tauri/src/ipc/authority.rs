@@ -23,7 +23,7 @@ use tauri_utils::platform::Target;
 use url::Url;
 
 use crate::{ipc::InvokeError, sealed::ManagerBase, Runtime};
-use crate::{AppHandle, Manager, StateManager};
+use crate::{AppHandle, Manager, StateManager, Webview};
 
 use super::{CommandArg, CommandItem};
 
@@ -322,7 +322,10 @@ impl RuntimeAuthority {
             .extend(command_scope.allow.clone());
           command_scope_entry.deny.extend(command_scope.deny.clone());
 
-          self.scope_manager.command_cache.remove(&scope_id);
+          self
+            .scope_manager
+            .command_cache
+            .insert(scope_id, StateManager::new());
         }
       }
 
@@ -614,6 +617,33 @@ pub struct CommandScope<T: ScopeObject> {
 }
 
 impl<T: ScopeObject> CommandScope<T> {
+  pub(crate) fn resolve<R: Runtime>(
+    webview: &Webview<R>,
+    scope_ids: Vec<u64>,
+  ) -> crate::Result<Self> {
+    let mut allow = Vec::new();
+    let mut deny = Vec::new();
+
+    for scope_id in scope_ids {
+      let scope = webview
+        .manager()
+        .runtime_authority
+        .lock()
+        .unwrap()
+        .scope_manager
+        .get_command_scope_typed::<R, T>(webview.app_handle(), &scope_id)?;
+
+      for s in scope.allows() {
+        allow.push(s.clone());
+      }
+      for s in scope.denies() {
+        deny.push(s.clone());
+      }
+    }
+
+    Ok(CommandScope { allow, deny })
+  }
+
   /// What this access scope allows.
   pub fn allows(&self) -> &Vec<Arc<T>> {
     &self.allow
@@ -622,6 +652,69 @@ impl<T: ScopeObject> CommandScope<T> {
   /// What this access scope denies.
   pub fn denies(&self) -> &Vec<Arc<T>> {
     &self.deny
+  }
+}
+
+impl<T: ScopeObjectMatch> CommandScope<T> {
+  /// Ensure all deny scopes were not matched and any allow scopes were.
+  ///
+  /// This **WILL** return `true` if the allow scopes are empty and the deny
+  /// scopes did not trigger. If you require at least one allow scope, then
+  /// ensure the allow scopes are not empty before calling this method.
+  ///
+  /// ```
+  /// # use tauri::ipc::CommandScope;
+  /// # fn command(scope: CommandScope<()>) -> Result<(), &'static str> {
+  /// if scope.allows().is_empty() {
+  ///   return Err("you need to specify at least 1 allow scope!");
+  /// }
+  /// # Ok(())
+  /// # }
+  /// ```
+  ///
+  /// # Example
+  ///
+  /// ```
+  /// # use serde::{Serialize, Deserialize};
+  /// # use url::Url;
+  /// # use tauri::{ipc::{CommandScope, ScopeObjectMatch}, command};
+  /// #
+  /// #[derive(Debug, Clone, Serialize, Deserialize)]
+  /// # pub struct Scope;
+  /// #
+  /// # impl ScopeObjectMatch for Scope {
+  /// #   type Input = str;
+  /// #
+  /// #   fn matches(&self, input: &str) -> bool {
+  /// #     true
+  /// #   }
+  /// # }
+  /// #
+  /// # fn do_work(_: String) -> Result<String, &'static str> {
+  /// #   Ok("Output".into())
+  /// # }
+  /// #
+  /// #[command]
+  /// fn my_command(scope: CommandScope<Scope>, input: String) -> Result<String, &'static str> {
+  ///   if scope.matches(&input) {
+  ///     do_work(input)
+  ///   } else {
+  ///     Err("Scope didn't match input")
+  ///   }
+  /// }
+  /// ```
+  pub fn matches(&self, input: &T::Input) -> bool {
+    // first make sure the input doesn't match any existing deny scope
+    if self.deny.iter().any(|s| s.matches(input)) {
+      return false;
+    }
+
+    // if there are allow scopes, ensure the input matches at least 1
+    if self.allow.is_empty() {
+      true
+    } else {
+      self.allow.iter().any(|s| s.matches(input))
+    }
   }
 }
 
@@ -635,29 +728,7 @@ impl<'a, R: Runtime, T: ScopeObject> CommandArg<'a, R> for CommandScope<T> {
         .collect::<Vec<_>>()
     });
     if let Some(scope_ids) = scope_ids {
-      let mut allow = Vec::new();
-      let mut deny = Vec::new();
-
-      for scope_id in scope_ids {
-        let scope = command
-          .message
-          .webview
-          .manager()
-          .runtime_authority
-          .lock()
-          .unwrap()
-          .scope_manager
-          .get_command_scope_typed::<R, T>(command.message.webview.app_handle(), &scope_id)?;
-
-        for s in scope.allows() {
-          allow.push(s.clone());
-        }
-        for s in scope.denies() {
-          deny.push(s.clone());
-        }
-      }
-
-      Ok(CommandScope { allow, deny })
+      CommandScope::resolve(&command.message.webview, scope_ids).map_err(Into::into)
     } else {
       Ok(CommandScope {
         allow: Default::default(),
@@ -672,6 +743,17 @@ impl<'a, R: Runtime, T: ScopeObject> CommandArg<'a, R> for CommandScope<T> {
 pub struct GlobalScope<T: ScopeObject>(ScopeValue<T>);
 
 impl<T: ScopeObject> GlobalScope<T> {
+  pub(crate) fn resolve<R: Runtime>(webview: &Webview<R>, plugin: &str) -> crate::Result<Self> {
+    webview
+      .manager()
+      .runtime_authority
+      .lock()
+      .unwrap()
+      .scope_manager
+      .get_global_scope_typed(webview.app_handle(), plugin)
+      .map(Self)
+  }
+
   /// What this access scope allows.
   pub fn allows(&self) -> &Vec<Arc<T>> {
     &self.0.allow
@@ -686,20 +768,11 @@ impl<T: ScopeObject> GlobalScope<T> {
 impl<'a, R: Runtime, T: ScopeObject> CommandArg<'a, R> for GlobalScope<T> {
   /// Grabs the [`ResolvedScope`] from the [`CommandItem`] and returns the associated [`GlobalScope`].
   fn from_command(command: CommandItem<'a, R>) -> Result<Self, InvokeError> {
-    command
-      .message
-      .webview
-      .manager()
-      .runtime_authority
-      .lock()
-      .unwrap()
-      .scope_manager
-      .get_global_scope_typed(
-        command.message.webview.app_handle(),
-        command.plugin.unwrap_or(APP_ACL_KEY),
-      )
-      .map_err(InvokeError::from_error)
-      .map(GlobalScope)
+    GlobalScope::resolve(
+      &command.message.webview,
+      command.plugin.unwrap_or(APP_ACL_KEY),
+    )
+    .map_err(InvokeError::from_error)
   }
 }
 
@@ -727,6 +800,51 @@ impl<T: Send + Sync + Debug + DeserializeOwned + 'static> ScopeObject for T {
   fn deserialize<R: Runtime>(_app: &AppHandle<R>, raw: Value) -> Result<Self, Self::Error> {
     serde_json::from_value(raw.into())
   }
+}
+
+/// A [`ScopeObject`] whose validation can be represented as a `bool`.
+///
+/// # Example
+///
+/// ```
+/// # use serde::{Deserialize, Serialize};
+/// # use tauri::{ipc::ScopeObjectMatch, Url};
+/// #
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// #[serde(rename_all = "camelCase")]
+/// pub enum Scope {
+///   Domain(Url),
+///   StartsWith(String),
+/// }
+///
+/// impl ScopeObjectMatch for Scope {
+///   type Input = str;
+///
+///   fn matches(&self, input: &str) -> bool {
+///     match self {
+///       Scope::Domain(url) => {
+///         let parsed: Url = match input.parse() {
+///           Ok(parsed) => parsed,
+///           Err(_) => return false,
+///         };
+///
+///         let domain = parsed.domain();
+///
+///         domain.is_some() && domain == url.domain()
+///       }
+///       Scope::StartsWith(start) => input.starts_with(start),
+///     }
+///   }
+/// }
+/// ```
+pub trait ScopeObjectMatch: ScopeObject {
+  /// The type of input expected to validate against the scope.
+  ///
+  /// This will be borrowed, so if you want to match on a `&str` this type should be `str`.
+  type Input: ?Sized;
+
+  /// Check if the input matches against the scope.
+  fn matches(&self, input: &Self::Input) -> bool;
 }
 
 impl ScopeManager {
